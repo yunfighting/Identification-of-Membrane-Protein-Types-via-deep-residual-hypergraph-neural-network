@@ -94,7 +94,7 @@ optional arguments:
 
 ## reference
 
-We do some modification and innovation referring to the code of  *Residual Enhanced Multi-Hypergraph Neural Network*  
+We do modification and innovation referring to the code of  *Residual Enhanced Multi-Hypergraph Neural Network*  
 
 ```
 # @inproceedings{icip21-ResMHGNN,
