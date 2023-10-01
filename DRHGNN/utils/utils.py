@@ -5,25 +5,28 @@ import torch
 from typing import Union, Tuple, List
 import path
 import random
+from sklearn.cluster import KMeans
+import pandas as pd
+from sklearn.metrics import f1_score, matthews_corrcoef, confusion_matrix,precision_score, recall_score #2023.10.1
 
-def get_balanced_sub_idx(ytrs, mask_val):
+def get_balanced_sub_idx(y, mask_train):
     from collections import Counter
-
-    counter = Counter(ytrs.tolist())
+    ytr = y[mask_train]
+    counter = Counter(ytr.tolist())
     p = min(counter.values())
 
     idx = []
-    C = ytrs.max().item() + 1
+    C = y.max().item() + 1
 
     for c in range(C):
-        idx += torch.nonzero(ytrs == c).squeeze().tolist()[:p]
+        idx += torch.nonzero(ytr == c).squeeze().tolist()[:p]
 
-    N = ytrs.shape[0]
-    mask_train_b = idx
-    mask_val_b = list(set(range(N)) - set(idx))+(list(mask_val))
+    N = y.shape[0]
+    mask_train = torch.LongTensor(idx) 
+    mask_val = torch.LongTensor(list(set(range(N)) - set(idx) ))
 
-    print(f'we use only Ntr = {len(idx)} ({p} per class x {C}) instead of {ytrs.shape[0]}')
-    return mask_train_b, mask_val_b
+    print(f'we use only Ntr = {len(idx)} ({p} per class x {C}) instead of {ytr.shape[0]}')
+    return mask_train, mask_val
 
 def get_split(Y, p=0.2):
     Y = Y.tolist()
@@ -81,11 +84,13 @@ def generate_H(X, k_nearest, cached_dir=None, add_self_loop=True):
             torch.save(H, fH)
     if add_self_loop:
         N, M = H[0].max()+1, H[1].max()+1 
-        self_loops = torch.LongTensor(range(0, N))
+        self_loops = torch.LongTensor(range(0, N)).to(H.device)
         self_loops = torch.stack((self_loops, self_loops+M-0))
         H = torch.hstack((H, self_loops))
     return H 
     return create_sparse_H(H)
+
+
 
 def create_sparse_H(H: torch.Tensor):
     # H: 2 x nnz
@@ -95,15 +100,16 @@ def create_sparse_H(H: torch.Tensor):
     import scipy.sparse as sp 
     import torch
     import torch_sparse
-
-    H = sp.csr_matrix((torch.ones_like(H[0]), H.tolist())) 
+    # M = H[1].max() + 1
+    H = sp.csr_matrix((torch.ones_like((H.cpu())[0]), H.cpu().tolist()))
     N, M = H.shape
     Dv = sp.spdiags(np.power(H.sum(1).reshape(-1), -0.5), 0, N, N)
     De = sp.spdiags(np.power(H.sum(0).reshape(-1), -1.), 0, M, M)
     Hv = Dv * H * De * H.transpose() * Dv # V x V, for HGNN
 
     (row, col), value = torch_sparse.from_scipy(Hv)
-
+    # Hv = Hv.tocoo()
+    # row, col, value = Hv.row, Hv.col, Hv.data
     H = torch.sparse.FloatTensor(torch.stack((row, col)), value, (N, N) ).float() # V x V
     return H 
 
@@ -115,7 +121,8 @@ def load_data(data_dir, selected_mod=(0, 1, 2, 3, 4)):
 
     Xs = [torch.FloatTensor(data['X'][imod].item()) for imod in selected_mod]
     idx = torch.LongTensor(data['indices'].item().squeeze())
-
+    # idx_train = (idx == 1)
+    # idx_test = (idx == 0)
     idx_train = np.where(idx == 1)[0]
     idx_test = np.where(idx == 0)[0]
 
@@ -160,6 +167,22 @@ def pairwise_euclidean_distance(x: torch.Tensor):
     dis = x_square + x_inner + x_square_transpose
     return dis
 
+# 新增 2023.9
+def sample_ids_v2(ids, k):
+    """
+    purely sample `k` indexes from ids
+    :param ids: indexes sampled from
+    :param k: number of samples
+    :return: sampled indexes
+    """
+    df = pd.DataFrame(ids)  # 最近的簇中节点集合
+    sampled_ids = df.sample(k, replace=True).values  # 可重复采样
+    sampled_ids = sampled_ids.flatten().tolist()
+    return sampled_ids
+
+
+
+
 def neighbor_distance(x: torch.Tensor, k_nearest, dis_metric=pairwise_euclidean_distance):
     """
     construct hyperedge for each node in x matrix. Each hyperedge contains a node and its k-1 nearest neighbors.
@@ -179,9 +202,77 @@ def neighbor_distance(x: torch.Tensor, k_nearest, dis_metric=pairwise_euclidean_
     return H
 
 def accuracy(Z, Y):
-    return 100 * Z.argmax(1).eq(Y).float().mean().item()
+    return Z.argmax(1).eq(Y).float().mean().item()
 
+def class_accuracy(pred, y, class_label):
+    class_indices = (y == class_label).nonzero(as_tuple=True)[0]
+    class_pred = pred[class_indices]
+    class_labels = y[class_indices]
 
+    class_acc = accuracy(class_pred, class_labels)
+    return class_acc
+
+# 2023.10.1
+def calculate_f1_score(pred, y):
+    # 转换预测值为最接近的类别
+    pred_labels = torch.argmax(pred, dim=1)
+
+    # 将 tensor 转换为 numpy 数组
+    pred_labels = pred_labels.cpu().numpy()
+    y = y.cpu().numpy()
+
+    # 初始化一个空列表，用于存储每个类别的 F1-score
+    f1_scores = []
+
+    # 计算每个类别的 F1-score
+    unique_labels = set(y)  # 获取真实标签中的唯一类别
+    for label in unique_labels:
+        # 从预测值和真实标签中筛选出当前类别的样本
+        pred_label = (pred_labels == label)
+        y_label = (y == label)
+        # 计算当前类别的 F1-score
+        f1 = f1_score(y_label, pred_label, average='binary')
+        f1_scores.append(f1)
+    f1_scores_tensor = torch.tensor(f1_scores)
+    # 计算整体的 F1-score
+    macro_f1 = f1_score(y, pred_labels, average='macro')
+
+    return f1_scores_tensor, macro_f1
+
+# 2023.10.1
+def calculate_mcc(pred, y_true):
+    # 转换为NumPy数组
+    pred = pred.cpu().detach().numpy()
+    y_true = y_true.cpu().detach().numpy()
+
+    # 根据特征表示计算类别预测
+    predicted_labels = np.argmax(pred, axis=1)
+
+    # 计算整体种类的MCC
+    overall_mcc = matthews_corrcoef(y_true, predicted_labels)
+
+    # 计算混淆矩阵
+    confusion_mat = confusion_matrix(y_true, predicted_labels)
+
+    # 计算每个类别的MCC
+    class_mcc = []
+    num_classes = len(np.unique(y_true))
+    for i in range(num_classes):
+        tp = confusion_mat[i, i]
+        fp = sum(confusion_mat[:, i]) - tp
+        fn = sum(confusion_mat[i, :]) - tp
+        tn = np.sum(confusion_mat) - tp - fp - fn
+
+        # 检查除数是否为0
+        divisor = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+        if divisor == 0:
+            mcc = 0  # 或者可以设置为其他特定值
+        else:
+            mcc = (tp * tn - fp * fn) / np.sqrt(divisor)
+
+        class_mcc.append(mcc)
+    class_mcc_tensor = torch.tensor(class_mcc)
+    return overall_mcc, class_mcc_tensor
 
 def hyedge_concat(Hs: Union[Tuple[torch.Tensor, ...], List[torch.Tensor]], same_node=True):
     node_num = 0
@@ -209,7 +300,7 @@ def count_hyedge(H, hyedge_num=None):
 
 def contiguous_hyedge_idx(H):
     node_idx, hyedge_idx = H
-    unorder_pairs = [(hyedge_id, sequence_id) for sequence_id, hyedge_id in enumerate(hyedge_idx.numpy().tolist())]
+    unorder_pairs = [(hyedge_id, sequence_id) for sequence_id, hyedge_id in enumerate(hyedge_idx.cpu().numpy().tolist())]
     unorder_pairs.sort(key=lambda x: x[0])
     new_hyedge_id = -1
     pre_hyedge_id = None
@@ -221,5 +312,5 @@ def contiguous_hyedge_idx(H):
             pre_hyedge_id = hyedge_id
         new_hyedge_idx.append(new_hyedge_id)
         sequence_idx.append(sequence_id)
-    hyedge_idx[sequence_idx] = torch.LongTensor(new_hyedge_idx)
+    hyedge_idx[sequence_idx] = torch.LongTensor(new_hyedge_idx).to(H.device)
     return torch.stack([node_idx, hyedge_idx])
